@@ -25,6 +25,7 @@ import os
 import numpy as np
 import datetime as dt
 import subprocess as sp
+import torch.profiler
 
 # logging
 import utils.mlperf_log_utils as mll
@@ -49,6 +50,7 @@ from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 #comm wrapper
 from utils import comm
+from torch.profiler import profile, record_function, ProfilerActivity
 
 #main function
 def main(pargs):
@@ -197,55 +199,69 @@ def main(pargs):
     logger.log_end(key = "init_stop", sync = True)
     logger.log_start(key = "run_start", sync = True)
 
-    # training loop
-    while True:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        # training loop
+        while True:
 
-        # start epoch
-        logger.log_start(key = "epoch_start", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync=True)
+            # start epoch
+            logger.log_start(key = "epoch_start", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync=True)
 
-        train_loader.sampler.set_epoch(epoch)
+            train_loader.sampler.set_epoch(epoch)
 
-        # training
-        step = train_epoch(pargs, comm_rank, comm_size,
-                           device, step, epoch, 
-                           net_train, criterion, 
-                           optimizer, scheduler,
-                           train_loader,
-                           logger)
+            # training
+            step = train_epoch(pargs, comm_rank, comm_size,
+                            device, step, epoch, 
+                            net_train, criterion, 
+                            optimizer, scheduler,
+                            train_loader,
+                            logger)
 
-        # average BN stats
-        bnstats_handler.synchronize()
-        
-        # validation
-        stop_training = validate(pargs, comm_rank, comm_size,
-                                 device, step, epoch, 
-                                 net_validate, criterion, validation_loader, 
-                                 logger)
+            # average BN stats
+            bnstats_handler.synchronize()
+            
+            # validation
+            stop_training = validate(pargs, comm_rank, comm_size,
+                                    device, step, epoch, 
+                                    net_validate, criterion, validation_loader, 
+                                    logger)
 
-        # log the epoch
-        logger.log_end(key = "epoch_stop", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
-        epoch += 1
-        
-        #save model if desired
-        if (pargs.save_frequency > 0) and (epoch % pargs.save_frequency == 0):
-            logger.log_start(key = "save_start", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
-            if comm_rank == 0:
-                checkpoint = {
-                    'step': step,
-                    'epoch': epoch,
-                    'model': net_train.state_dict(),
-                    'optimizer': optimizer.state_dict()
-                }
-                torch.save(checkpoint, os.path.join(output_dir, pargs.model_prefix + "_step_" + str(step) + ".cpt") )
-                logger.log_end(key = "save_stop", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
-                    
-        # are we done?
-        if (epoch >= pargs.max_epochs) or stop_training:
-            break
-
+            # log the epoch
+            logger.log_end(key = "epoch_stop", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
+            epoch += 1
+            
+            #save model if desired
+            if (pargs.save_frequency > 0) and (epoch % pargs.save_frequency == 0):
+                logger.log_start(key = "save_start", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
+                if comm_rank == 0:
+                    checkpoint = {
+                        'step': step,
+                        'epoch': epoch,
+                        'model': net_train.state_dict(),
+                        'optimizer': optimizer.state_dict()
+                    }
+                    torch.save(checkpoint, os.path.join(output_dir, pargs.model_prefix + "_step_" + str(step) + ".cpt") )
+                    logger.log_end(key = "save_stop", metadata = {'epoch_num': epoch+1, 'step_num': step}, sync = True)
+                        
+            # are we done?
+            if (epoch >= pargs.max_epochs) or stop_training:
+                break
+    
     # run done
     logger.log_end(key = "run_stop", sync = True, metadata = {'status' : 'success'})
+    
+    slurm_job_id = os.getenv("SLURM_JOB_ID")
+    profiler_output_dir = "/pscratch/sd/c/cunyang/deepcam/benchmark/profiler_output/" + slurm_job_id
+    if not os.path.exists(profiler_output_dir):
+        os.makedirs(profiler_output_dir)
 
+    trace_file = os.path.join(profiler_output_dir, f"profiler_trace_{comm_rank}.json")
+    prof.export_chrome_trace(trace_file)
+
+    #trace_file = "/pscratch/sd/c/cunyang/deepcam/benchmark/profiler_trace.json"
+    #prof.export_chrome_trace(trace_file)
+
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+    print(prof.key_averages().table(sort_by="gpu_time_total", row_limit=10))
 
 if __name__ == "__main__":
 
